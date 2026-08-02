@@ -18,37 +18,45 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 from see_the_files import main as _stf_main
+
+
+def _write_log(text: str) -> Path:
+    log_path = Path(sys.argv[0]).resolve().parent / "SeeTheFiles-Run.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError:
+        pass
+    return log_path
 
 
 def _fatal(msg: str) -> int:
     """Surface errors to the user.
 
     When packaged --windowed there is no console, so a silent crash would leave
-    the user with nothing. Write a small .log next to the exe and also pop a
-    message via a temp HTML notice so failures are never invisible.
+    the user with nothing. Use a native Win32 message box (works without a
+    console) and also write the full detail to SeeTheFiles-Run.log.
+
+    NOTE: we deliberately do NOT open a file:// HTML page in the browser — modern
+    browsers block cross-file:// navigation as a security origin violation, which
+    would just produce a confusing second error instead of the real one.
     """
-    log_path = Path(sys.argv[0]).resolve().parent / "SeeTheFiles-Run.log"
-    try:
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(msg + "\n")
-    except OSError:
-        pass
-    try:
-        notice = Path(tempfile.gettempdir()) / "SeeTheFiles_error.html"
-        notice.write_text(
-            "<!doctype html><meta charset=utf-8><title>SeeTheFiles</title>"
-            f"<body style='font-family:sans-serif;padding:24px'>"
-            f"<h2>SeeTheFiles 运行出错</h2><pre style='white-space:pre-wrap'>{msg}</pre>"
-            f"</body>",
-            encoding="utf-8",
-        )
-        import webbrowser
-        webbrowser.open(notice.as_uri())
-    except Exception:
-        pass
+    log_path = _write_log(msg)
+    detail = f"{msg}\n\n详细日志已写入:\n{log_path}"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, detail, "SeeTheFiles 运行出错", 0x10  # MB_ICONERROR
+            )
+        except Exception:
+            pass
+    else:
+        print(detail, file=sys.stderr)
     return 1
 
 
@@ -64,8 +72,9 @@ def main() -> int:
         return _fatal(f"不是文件夹: {target}")
     try:
         return _stf_main(argv)
-    except Exception as exc:  # pragma: no cover - defensive
-        return _fatal(f"渲染失败: {exc}")
+    except Exception:  # pragma: no cover - defensive
+        tb = traceback.format_exc()
+        return _fatal(f"渲染失败:\n{tb}")
 
 
 if __name__ == "__main__":
