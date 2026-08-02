@@ -679,13 +679,17 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin:0; height:100%; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--text); }}
-.app {{ display:grid; grid-template-columns: 38% 62%; height:100vh; }}
+.app {{ display:grid; grid-template-columns: var(--tree-w, 38%) 7px 1fr; grid-template-rows: auto 1fr; height:100vh; }}
+.splitter {{ grid-column:2; grid-row:2; cursor:col-resize; background:var(--line); position:relative; transition: background .12s ease; }}
+.splitter:hover, .splitter.dragging {{ background: var(--accent); }}
+.splitter::after {{ content:''; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:2px; height:28px; border-radius:2px; background:#64748b; }}
+.splitter:hover::after, .splitter.dragging::after {{ background:#fff; }}
 header {{ grid-column: 1 / -1; display:flex; align-items:center; gap:12px; padding:12px 18px; background: linear-gradient(90deg, var(--panel), var(--panel-2)); border-bottom:1px solid var(--line); }}
 header .logo {{ width:30px;height:30px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff; }}
 header h1 {{ font-size:16px; margin:0; }}
 header .path {{ font-size:12px; color:var(--muted); margin-left:auto; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 /* Tree panel */
-.tree-panel {{ overflow:auto; padding:14px 8px 40px 18px; border-right:1px solid var(--line); background:var(--panel); }}
+.tree-panel {{ overflow:auto; padding:14px 8px 40px 18px; border-right:1px solid var(--line); background:var(--panel); min-width:0; }}
 .tree-panel ul {{ list-style:none; margin:0; padding-left:18px; position:relative; }}
 .tree-panel > ul {{ padding-left:4px; }}
 .tree-panel ul ul {{ border-left:1px dashed var(--line); }}
@@ -717,12 +721,12 @@ header .path {{ font-size:12px; color:var(--muted); margin-left:auto; max-width:
 .node.file.active > .row {{ background: var(--accent); color:#fff; }}
 .node.file.active > .row .sz {{ color:#e0e7ff; }}
 /* Preview panel */
-.preview-panel {{ display:flex; flex-direction:column; background: var(--bg); overflow:hidden; }}
+.preview-panel {{ display:flex; flex-direction:column; background: var(--bg); overflow:hidden; min-width:0; }}
 .preview-head {{ padding:12px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; background:var(--panel-2); }}
 .preview-head .fname {{ font-size:14px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 .preview-head .ftag {{ font-size:11px; padding:2px 8px; border-radius:999px; background:var(--line); color:var(--muted); }}
 .preview-body {{ flex:1; overflow:auto; padding:0; }}
-.preview-body pre {{ margin:0; padding:18px; font-family:"JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace; font-size:13px; line-height:1.55; white-space:pre; tab-size:4; }}
+.preview-body pre {{ margin:0; padding:18px; font-family:"JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace; font-size:13px; line-height:1.55; white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; tab-size:4; }}
 .placeholder {{ display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; color:var(--muted); gap:10px; text-align:center; padding:30px; }}
 .placeholder .big {{ font-size:46px; opacity:.5; }}
 .notice {{ margin:18px; padding:16px; border-radius:12px; background:var(--panel); border:1px solid var(--line); }}
@@ -752,6 +756,7 @@ mark {{ background:#fde68a; color:#1f2937; border-radius:3px; padding:0 2px; }}
     <div class="search"><input id="search" placeholder="过滤节点… (支持名称子串)" oninput="filterTree(this.value)"></div>
     <ul>__TREE__</ul>
   </div>
+  <div class="splitter" id="splitter" title="拖动调整宽度"></div>
   <div class="preview-panel">
     <div class="preview-head">
       <span class="fname" id="pv-name">未选择文件</span>
@@ -879,6 +884,43 @@ function filterTree(q){{
   }});
 }}
 document.addEventListener('keydown', e=>{{ if(e.key==='/' && document.activeElement!==document.getElementById('search')){{ e.preventDefault(); document.getElementById('search').focus(); }} }});
+
+// Resizable splitter between the tree and preview panels. The tree column
+// width is a CSS var (--tree-w) on .app; dragging the splitter updates it
+// live and persists to localStorage so the chosen split survives reloads.
+// Uses Pointer Events (mouse + touch); setPointerCapture keeps receiving
+// moves even when the cursor leaves the 7px bar.
+(function(){{
+  const splitter = document.getElementById('splitter');
+  const root = document.querySelector('.app');
+  if (!splitter || !root) return;
+  const KEY = 'seethefiles.treeW';
+  const saved = parseFloat(localStorage.getItem(KEY));
+  if (saved && saved > 0) root.style.setProperty('--tree-w', saved + '%');
+  let dragging = false;
+  splitter.addEventListener('pointerdown', (e) => {{
+    dragging = true; splitter.classList.add('dragging');
+    document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
+    try {{ splitter.setPointerCapture(e.pointerId); }} catch(_) {{}}
+    e.preventDefault();
+  }});
+  document.addEventListener('pointermove', (e) => {{
+    if (!dragging) return;
+    // Tree starts at x=0, so clientX == desired tree width in px.
+    const pct = e.clientX / window.innerWidth * 100;
+    const clamped = Math.max(15, Math.min(80, pct));
+    root.style.setProperty('--tree-w', clamped + '%');
+  }});
+  const stop = () => {{
+    if (!dragging) return;
+    dragging = false; splitter.classList.remove('dragging');
+    document.body.style.cursor = ''; document.body.style.userSelect = '';
+    const cur = root.style.getPropertyValue('--tree-w');
+    if (cur) localStorage.setItem(KEY, cur);
+  }};
+  document.addEventListener('pointerup', stop);
+  document.addEventListener('pointercancel', stop);
+}})();
 </script>
 </body>
 </html>"""
