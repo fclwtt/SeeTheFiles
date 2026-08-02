@@ -494,9 +494,37 @@ def render_html(scan: ScanResult, cfg: Config, root_path: str) -> str:
         "max_embed_bytes": cfg.max_embed_bytes,
     }
 
-    # Use __KEY__ placeholders instead of .format() to avoid clashes with the
-    # literal {{ }} braces inside the embedded JSON and CSS.
-    return (_HTML_TEMPLATE
+    # The template was originally authored for str.format(), so every CSS/JS
+    # brace is doubled ({{ }}) as a format() escape. Rendering now uses
+    # __KEY__ placeholders, so those doubled braces must be collapsed back to
+    # single braces — otherwise the browser sees ${{...}} / {{STATS.x}} as
+    # literal text, the <script> throws "Unexpected token '{'", and every JS
+    # function (toggle / preview / ...) ends up undefined.
+    #
+    # CRITICAL: this brace fix is applied to the RAW template BEFORE the
+    # __KEY__ substitutions. Doing it AFTER would run a global {{ → { over the
+    # already-inserted PAYLOADS JSON / tree HTML and corrupt any file preview
+    # whose content legitimately contains "{{" (Python f-strings, Jinja/
+    # Mustache templates, C++ brace init, …). Fixing the template first leaves
+    # all dynamic content untouched.
+    #
+    # Order matters:
+    #   1. ${{           → ${            (JS interpolation that kept its $)
+    #   2. {{STATS       → ${STATS       (JS interpolation that lost its $)
+    #   3. {{formatSize  → ${formatSize  (same — lost its $)
+    #   4. {{ → { , }} → }               (all remaining CSS/JS braces)
+    # Steps 2-3 must precede 4, otherwise the generic {{ → { would turn them
+    # into plain {...} (literal text, not interpolation). "${" is never "{{",
+    # so step 4 never damages the ${...} produced by steps 1-3.
+    template = (_HTML_TEMPLATE
+                .replace("${{", "${")
+                .replace("{{STATS", "${STATS")
+                .replace("{{formatSize", "${formatSize")
+                .replace("{{", "{")
+                .replace("}}", "}"))
+    # __KEY__ placeholders (not .format()) avoid clashes with the literal
+    # braces inside the embedded JSON and CSS.
+    return (template
             .replace("__TITLE__", html.escape(scan.tree["name"]))
             .replace("__ROOT_PATH__", html.escape(root_path))
             .replace("__ACCENT__", cfg.accent)
@@ -618,7 +646,7 @@ function renderStats(){{
   if (STATS.truncated_files) html += `<span class="warn">⚠ 已达到文件上限 {{STATS.max_files}}，已截断</span>`;
   if (STATS.truncated_depth) html += `<span class="warn">⚠ 已达深度上限 {{STATS.max_depth}}，已截断</span>`;
   if (STATS.symlink_loops) html += `<span class="warn">🔗 跳过符号链接环 {{STATS.symlink_loops}} 处</span>`;
-  if (STATS.embedded < STATS.files) html += `<span class="warn">📦 内嵌预览 {{STATS.embedded}}/{STATS.files}（其余已禁用以控体积）</span>`;
+  if (STATS.embedded < STATS.files) html += `<span class="warn">📦 内嵌预览 {{STATS.embedded}}/${STATS.files}（其余已禁用以控体积）</span>`;
   el.innerHTML = html;
 }}
 renderStats();
