@@ -1,0 +1,36 @@
+# SeeTheFiles configuration
+# All settings can be overridden via CLI flags (run: python see_the_files.py --help)
+
+[scan]
+# Default ignore list (directory or file basenames). Matched case-insensitively.
+ignore_names = [".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "dist", "build"]
+# Never descend into these (in addition to ignore_names). Symlinks are also guarded by realpath cycle detection.
+ignore_symlink_targets = []
+# Maximum directory depth to descend (root dir = depth 0).
+max_depth = 12
+# Hard cap on total entries (files + dirs) collected. Exceeding this truncates the scan gracefully.
+# Default 100000 (>= "数万文件" benchmark of 50k; still a hard safety ceiling).
+max_files = 100000
+
+[preview]
+# Max number of bytes of a single text file to embed into the HTML for inline preview.
+max_preview_bytes = 524288
+# Max number of files whose content is embedded. Beyond this, text files still appear
+# in the tree but preview shows a friendly notice (bounds HTML size for huge dirs).
+max_embed_files = 20000
+# Total budget (bytes) for embedded preview content. Prevents the 5000 x 512KB = 2.5GB
+# OOM path on directories full of large text/log files. Secondary to max_embed_files.
+max_embed_bytes = 67108864
+# Extensions (lowercase, with dot) treated as text/code and previewable. Unknown extensions are
+# sniffed by content (see sniff_text() in see_the_files.py).
+text_extensions = [
+    ".txt", ".md", ".markdown", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash", ".zsh", ".fish", ".bat", ".cmd", ".ps1",
+    ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".java", ".go", ".rs", ".rb", ".php", ".pl",
+    ".lua", ".sql", ".html", ".htm", ".css", ".scss", ".less", ".xml", ".svg", ".csv", ".log",
+    ".rst", ".tex", ".r", ".kt", ".swift", ".dart", ".vue", ".dockerfile", ".gitignore", ".env"
+]
+
+[ui]
+# Theme accent color for the generated HTML view.
+accent = "#6366f1"

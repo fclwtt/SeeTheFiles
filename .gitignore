@@ -1,0 +1,17 @@
+# Build artifacts (PyInstaller)
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs / runtime temp
+*.log
+SeeTheFiles-Run.log
+
+# OS
+.DS_Store
