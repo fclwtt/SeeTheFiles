@@ -17,6 +17,7 @@ import base64
 import html
 import json
 import os
+import re
 import sys
 import tempfile
 import webbrowser
@@ -55,10 +56,18 @@ DEFAULT_IGNORE_NAMES = {
 OFFICE_KIND = {".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx"}
 MAX_PDF_EMBED_BYTES = 8 * 1024 * 1024  # per-file cap for inline PDF embed
 
+# Caps for the rendered XLSX table (a single dense sheet could otherwise
+# produce a multi-MB table that jank-scrolls the browser). Beyond these the
+# table is truncated and a notice tells the user to open it in Excel.
+MAX_XLSX_ROWS = 1000
+MAX_XLSX_COLS = 40
+
 # XML namespaces for OOXML text extraction (WordprocessingML / DrawingML / SpreadsheetML).
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+# Relationship namespace: the r:id attribute on <sheet> that maps to a worksheet file.
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 @dataclass
@@ -336,13 +345,14 @@ def scan_directory(root: Path, cfg: Config) -> ScanResult:
 # --------------------------------------------------------------------------- #
 
 def _extract_ooxml_text(path: Path, kind: str) -> str:
-    """Extract readable text from a .docx/.xlsx/.pptx (OOXML = ZIP + XML).
+    """Extract readable text from a .docx/.pptx (OOXML = ZIP + XML).
 
     Uses only the standard library (zipfile + ElementTree). Output is plain
-    text with newlines per paragraph / shared-string / slide. Formatting,
-    images and table layout are lost — this is a content preview, not a
-    fidelity renderer. Returns "" on any failure (caller treats empty as
-    "could not extract" and falls back to a binary notice).
+    text with newlines per paragraph / slide. Formatting, images and table
+    layout are lost — this is a content preview, not a fidelity renderer.
+    XLSX is handled separately by _extract_xlsx_html (renders a real table).
+    Returns "" on any failure (caller treats empty as "could not extract"
+    and falls back to a binary notice).
     """
     try:
         zf = zipfile.ZipFile(path)
@@ -374,20 +384,171 @@ def _extract_ooxml_text(path: Path, kind: str) -> str:
                     out.append(f"── 幻灯片 {idx} ──")
                     out.append("\n".join(texts))
             return "\n".join(out)
-        if kind == "xlsx":
-            try:
-                root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-            except KeyError:
-                return ""
-            for si in root.iter(f"{{{_S_NS}}}si"):
-                line = "".join(t.text for t in si.iter(f"{{{_S_NS}}}t") if t.text)
-                out.append(line)
-            return "\n".join(out)
     except ET.ParseError:
         return ""
     finally:
         zf.close()
     return ""
+
+
+def _col_letter(n: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA (spreadsheet column lettering)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _parse_cell_ref(ref: str):
+    """'B2' -> (col=2, row=2); 'AA10' -> (col=27, row=10). (None, None) on bad input."""
+    m = re.match(r"([A-Z]+)(\d+)", ref)
+    if not m:
+        return None, None
+    col = 0
+    for ch in m.group(1):
+        col = col * 26 + (ord(ch) - 64)
+    return col, int(m.group(2))
+
+
+def _xlsx_sheet_targets(zf) -> list:
+    """Return [(sheet_name, 'xl/worksheets/sheetN.xml'), ...] in workbook order.
+
+    Resolves the workbook's r:id -> Target via workbook.xml.rels so the sheet
+    order/names match what Excel shows (sheetN.xml numbering is not always the
+    display order). Falls back to [] if the workbook/rels parts are absent.
+    """
+    try:
+        wb = ET.fromstring(zf.read("xl/workbook.xml"))
+    except KeyError:
+        return []
+    ordered = []
+    for s in wb.iter(f"{{{_S_NS}}}sheet"):
+        name = s.get("name") or "Sheet"
+        rid = s.get(f"{{{_R_NS}}}id")
+        ordered.append((name, rid))
+    if not ordered:
+        return []
+    try:
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    except KeyError:
+        return []
+    rid_to_target = {}
+    for rel in rels:
+        rid = rel.get("Id")
+        target = rel.get("Target")
+        if rid and target:
+            # Target is relative to xl/ (e.g. "worksheets/sheet1.xml").
+            target = target.lstrip("/") if target.startswith("/") else "xl/" + target
+            rid_to_target[rid] = target
+    out = []
+    for name, rid in ordered:
+        tgt = rid_to_target.get(rid)
+        if tgt:
+            out.append((name, tgt))
+    return out
+
+
+def _extract_xlsx_html(path: Path):
+    """Render an .xlsx as HTML <table>(s) using stdlib only.
+
+    Reads sharedStrings + each worksheet (in workbook order, by name) and maps
+    cells by their reference (e.g. B2 -> row 2, col 2) into a grid, then emits
+    one sticky-header / sticky-row-number table per sheet. Cell values are
+    HTML-escaped so file content can never inject markup. Returns
+    (html_str, truncated_bool); ("", False) on failure.
+    """
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        return "", False
+    try:
+        # Shared strings table: cells with t="s" store an index into this.
+        shared: list[str] = []
+        try:
+            sst = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in sst.iter(f"{{{_S_NS}}}si"):
+                shared.append("".join(t.text or "" for t in si.iter(f"{{{_S_NS}}}t")))
+        except KeyError:
+            pass
+
+        targets = _xlsx_sheet_targets(zf)
+        if not targets:
+            # Fallback: any worksheets/sheet*.xml in name order.
+            targets = [("Sheet", n) for n in sorted(zf.namelist())
+                       if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+        if not targets:
+            return "", False
+
+        parts: list[str] = []
+        any_truncated = False
+        for name, tgt in targets:
+            try:
+                root = ET.fromstring(zf.read(tgt))
+            except KeyError:
+                continue
+            rows: dict[int, dict[int, str]] = {}
+            max_col = 0
+            max_row = 0
+            for c in root.iter(f"{{{_S_NS}}}c"):
+                ref = c.get("r")
+                if not ref:
+                    continue
+                col, row = _parse_cell_ref(ref)
+                if col is None:
+                    continue
+                t = c.get("t")
+                val = ""
+                v = c.find(f"{{{_S_NS}}}v")
+                if t == "s":
+                    if v is not None and v.text is not None:
+                        try:
+                            val = shared[int(v.text)]
+                        except (ValueError, IndexError):
+                            val = ""
+                elif t == "inlineStr":
+                    is_el = c.find(f"{{{_S_NS}}}is")
+                    if is_el is not None:
+                        val = "".join(tt.text or "" for tt in is_el.iter(f"{{{_S_NS}}}t"))
+                else:
+                    if v is not None and v.text is not None:
+                        val = v.text
+                rows.setdefault(row, {})[col] = val
+                if col > max_col:
+                    max_col = col
+                if row > max_row:
+                    max_row = row
+
+            parts.append(f'<div class="xlsx-sheet"><h4>{html.escape(name)}</h4>')
+            if not rows:
+                parts.append('<p class="muted">(空工作表)</p></div>')
+                continue
+
+            truncated = max_row > MAX_XLSX_ROWS or max_col > MAX_XLSX_COLS
+            any_truncated = any_truncated or truncated
+            cap_row = min(max_row, MAX_XLSX_ROWS)
+            cap_col = min(max_col, MAX_XLSX_COLS)
+
+            tbl = ['<table class="xlsx"><thead><tr><th></th>']
+            for col in range(1, cap_col + 1):
+                tbl.append(f"<th>{_col_letter(col)}</th>")
+            tbl.append("</tr></thead><tbody>")
+            for r in range(1, cap_row + 1):
+                tbl.append(f"<tr><th>{r}</th>")
+                row_cells = rows.get(r, {})
+                for col in range(1, cap_col + 1):
+                    tbl.append("<td>" + html.escape(row_cells.get(col, "")) + "</td>")
+                tbl.append("</tr>")
+            tbl.append("</tbody></table>")
+            if truncated:
+                tbl.append(f'<p class="muted">⚠ 已截断：仅显示前 {cap_row} 行 × {cap_col} 列，完整数据请用 Excel 打开。</p>')
+            parts.append("".join(tbl))
+            parts.append("</div>")
+        return "".join(parts), any_truncated
+    except ET.ParseError:
+        return "", False
+    finally:
+        zf.close()
 
 
 def extract_preview(path: Path, cfg: Config) -> dict:
@@ -419,8 +580,18 @@ def extract_preview(path: Path, cfg: Config) -> dict:
         return {"ok": True, "kind": "pdf", "content": base64.b64encode(raw).decode("ascii"),
                 "reason": None, "size": size, "truncated": False}
 
-    # Office OOXML: extract text via stdlib zipfile + ElementTree.
-    if kind in ("docx", "xlsx", "pptx"):
+    # Office OOXML: extract via stdlib zipfile + ElementTree. XLSX renders as
+    # an HTML table (payload carries html=True so the JS injects it directly,
+    # without escapeHtml / <pre>); DOCX/PPTX render as plain text.
+    if kind == "xlsx":
+        table_html, truncated = _extract_xlsx_html(path)
+        if not table_html:
+            return {"ok": False, "kind": "binary", "content": None,
+                    "reason": "无法从 Excel 文件提取表格（可能已损坏或非标准 OOXML）。",
+                    "size": size, "truncated": False}
+        return {"ok": True, "kind": "xlsx", "content": table_html, "html": True,
+                "reason": None, "size": size, "truncated": truncated}
+    if kind in ("docx", "pptx"):
         text = _extract_ooxml_text(path, kind)
         if not text:
             return {"ok": False, "kind": "binary", "content": None,
@@ -718,6 +889,16 @@ header .path {{ font-size:12px; color:var(--muted); margin-left:auto; max-width:
 .pdf-fallback {{ padding:10px 18px; font-size:12px; color:var(--muted); text-align:center; }}
 .pdf-fallback button {{ margin-left:6px; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:3px 10px; cursor:pointer; font-size:12px; }}
 .pdf-fallback button:hover {{ filter:brightness(1.1); }}
+/* XLSX table preview */
+.xlsx-sheet {{ margin:14px 18px; }}
+.xlsx-sheet h4 {{ margin:0 0 8px; font-size:13px; color:var(--text); }}
+.xlsx-sheet .muted {{ color:var(--muted); font-size:12px; margin:6px 0; }}
+table.xlsx {{ border-collapse:collapse; font-size:12px; font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace; }}
+table.xlsx th, table.xlsx td {{ border:1px solid var(--line); padding:3px 8px; white-space:nowrap; max-width:420px; overflow:hidden; text-overflow:ellipsis; }}
+table.xlsx thead th {{ position:sticky; top:0; background:var(--panel-2); color:var(--muted); font-weight:600; z-index:2; }}
+table.xlsx tbody th {{ position:sticky; left:0; background:var(--panel-2); color:var(--muted); font-weight:600; z-index:1; }}
+table.xlsx td {{ color:var(--text); }}
+table.xlsx tbody tr:nth-child(even) td {{ background:rgba(255,255,255,0.025); }}
 .node.file.active > .row {{ background: var(--accent); color:#fff; }}
 .node.file.active > .row .sz {{ color:#e0e7ff; }}
 /* Preview panel */
@@ -737,7 +918,7 @@ header .path {{ font-size:12px; color:var(--muted); margin-left:auto; max-width:
 .stats {{ font-size:11px; color:var(--muted); padding:6px 18px; border-top:1px solid var(--line); background:var(--panel); display:flex; gap:14px; flex-wrap:wrap; }}
 .stats .warn {{ color:#f59e0b; }}
 @keyframes fadein {{ from {{ opacity:0; transform: translateY(4px);}} to {{opacity:1; transform:none;}} }}
-.preview-body.preview-anim pre, .preview-body.preview-anim .notice {{ animation: fadein .18s ease; }}
+.preview-body.preview-anim pre, .preview-body.preview-anim .notice, .preview-body.preview-anim .xlsx-sheet {{ animation: fadein .18s ease; }}
 /* Search */
 .search {{ padding:8px 18px; border-bottom:1px solid var(--line); background:var(--panel); }}
 .search input {{ width:100%; padding:7px 11px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); font-size:13px; outline:none; }}
@@ -833,9 +1014,19 @@ function preview(row){{
     body.classList.remove('preview-anim'); void body.offsetWidth; body.classList.add('preview-anim');
     return;
   }}
-  // Office OOXML: text extracted server-side, shown like a text preview.
-  if (p.kind === 'docx' || p.kind === 'xlsx' || p.kind === 'pptx') {{
-    const labels = {{docx:'Word', xlsx:'Excel', pptx:'PowerPoint'}};
+  // XLSX: pre-built HTML table (cell values already HTML-escaped server-side).
+  // p.html marks HTML content, so inject directly — no escapeHtml, no <pre>.
+  if (p.kind === 'xlsx') {{
+    tag.textContent = 'Excel(表格)';
+    let tbl = p.content;
+    if (p.truncated) tbl += '<div class="notice warn"><p>⚠ 表格较大，已截断显示，完整数据请用 Excel 打开。</p></div>';
+    body.innerHTML = tbl;
+    body.classList.remove('preview-anim'); void body.offsetWidth; body.classList.add('preview-anim');
+    return;
+  }}
+  // DOCX / PPTX: extracted text, shown like a text preview.
+  if (p.kind === 'docx' || p.kind === 'pptx') {{
+    const labels = {{docx:'Word', pptx:'PowerPoint'}};
     tag.textContent = labels[p.kind] + '(文本)';
     let content = escapeHtml(p.content);
     if (p.truncated) content += '\\n\\n… (已截断，仅显示前 ' + formatSize(PAYLOADS_MAX) + '，完整内容请用 Office 打开)';
