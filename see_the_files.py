@@ -13,12 +13,15 @@ on process exit, nothing leaked to disk beyond the temp HTML which is regenerate
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import os
 import sys
 import tempfile
 import webbrowser
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -41,6 +44,21 @@ DEFAULT_IGNORE_NAMES = {
     ".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache",
     ".pytest_cache", ".idea", ".vscode", "dist", "build",
 }
+
+# Office Open XML (ZIP-packaged XML) and PDF: binary on disk but still
+# previewable. Office text is extracted with stdlib zipfile + ElementTree
+# (zero third-party deps); PDF is embedded as a base64 data URI so the
+# browser's built-in PDF viewer renders it inline. Using data: URIs (never
+# file: paths) for embedded media also avoids the "file: URLs are treated as
+# unique security origins" restriction — the embed is same-document content,
+# not a separate file:// origin the browser would block.
+OFFICE_KIND = {".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx"}
+MAX_PDF_EMBED_BYTES = 8 * 1024 * 1024  # per-file cap for inline PDF embed
+
+# XML namespaces for OOXML text extraction (WordprocessingML / DrawingML / SpreadsheetML).
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 
 @dataclass
@@ -169,11 +187,18 @@ def sniff_text(path: Path, chunk_size: int = 8192) -> bool:
 
 
 def classify_file(path: Path, size: int, cfg: Config) -> str:
-    """Return one of: 'text', 'large', 'binary'.
+    """Return file kind.
 
-    - large: text file but exceeds preview byte cap (still embeddable-truncated).
-    - binary: non-text extension/sniff.
+    - 'text' / 'large': text content (large = exceeds preview byte cap, truncated).
+    - 'pdf': PDF document — embedded as base64 data URI for the browser viewer.
+    - 'docx' / 'xlsx' / 'pptx': Office OOXML — text extracted via stdlib zipfile.
+    - 'binary': not previewable.
     """
+    ext = os.path.splitext(path.name)[1].lower()
+    if ext == ".pdf":
+        return "pdf"
+    if ext in OFFICE_KIND:
+        return OFFICE_KIND[ext]
     if size > cfg.max_preview_bytes:
         # Could still be text; classify by extension/sniff but flag as large.
         if is_text_extension(path.name, cfg) or sniff_text(path):
@@ -310,8 +335,63 @@ def scan_directory(root: Path, cfg: Config) -> ScanResult:
 # Preview content extraction (CAP-3)
 # --------------------------------------------------------------------------- #
 
+def _extract_ooxml_text(path: Path, kind: str) -> str:
+    """Extract readable text from a .docx/.xlsx/.pptx (OOXML = ZIP + XML).
+
+    Uses only the standard library (zipfile + ElementTree). Output is plain
+    text with newlines per paragraph / shared-string / slide. Formatting,
+    images and table layout are lost — this is a content preview, not a
+    fidelity renderer. Returns "" on any failure (caller treats empty as
+    "could not extract" and falls back to a binary notice).
+    """
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        return ""
+    out: list[str] = []
+    try:
+        if kind == "docx":
+            try:
+                root = ET.fromstring(zf.read("word/document.xml"))
+            except KeyError:
+                return ""
+            for p in root.iter(f"{{{_W_NS}}}p"):
+                line = "".join(t.text for t in p.iter(f"{{{_W_NS}}}t") if t.text)
+                out.append(line)
+            return "\n".join(out)
+        if kind == "pptx":
+            slide_names = sorted(
+                n for n in zf.namelist()
+                if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+            )
+            for idx, sn in enumerate(slide_names, 1):
+                try:
+                    root = ET.fromstring(zf.read(sn))
+                except KeyError:
+                    continue
+                texts = [t.text for t in root.iter(f"{{{_A_NS}}}t") if t.text]
+                if texts:
+                    out.append(f"── 幻灯片 {idx} ──")
+                    out.append("\n".join(texts))
+            return "\n".join(out)
+        if kind == "xlsx":
+            try:
+                root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            except KeyError:
+                return ""
+            for si in root.iter(f"{{{_S_NS}}}si"):
+                line = "".join(t.text for t in si.iter(f"{{{_S_NS}}}t") if t.text)
+                out.append(line)
+            return "\n".join(out)
+    except ET.ParseError:
+        return ""
+    finally:
+        zf.close()
+    return ""
+
+
 def extract_preview(path: Path, cfg: Config) -> dict:
-    """Return preview payload for a text/large file.
+    """Return preview payload for a text/large/pdf/office file.
 
     Returns dict with keys: ok(bool), kind, content(str|None), reason(str|None),
     size(int), truncated(bool).
@@ -322,9 +402,41 @@ def extract_preview(path: Path, cfg: Config) -> dict:
         return {"ok": False, "kind": "error", "content": None, "reason": f"无法读取文件: {exc}", "size": 0, "truncated": False}
 
     kind = classify_file(path, size, cfg)
+
+    # PDF: embed raw bytes as base64 so the browser's built-in viewer renders
+    # it inline via a data: URI. data: is NOT a file: URL, so this sidesteps
+    # the "file: URLs are unique security origins" cross-origin block.
+    if kind == "pdf":
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(MAX_PDF_EMBED_BYTES + 1)
+        except OSError as exc:
+            return {"ok": False, "kind": "error", "content": None, "reason": f"读取失败: {exc}", "size": size, "truncated": False}
+        if len(raw) > MAX_PDF_EMBED_BYTES:
+            return {"ok": False, "kind": "pdf-large", "content": None,
+                    "reason": f"PDF 超过 {MAX_PDF_EMBED_BYTES // (1024 * 1024)}MB 内嵌上限，未预览，请在外部打开。",
+                    "size": size, "truncated": False}
+        return {"ok": True, "kind": "pdf", "content": base64.b64encode(raw).decode("ascii"),
+                "reason": None, "size": size, "truncated": False}
+
+    # Office OOXML: extract text via stdlib zipfile + ElementTree.
+    if kind in ("docx", "xlsx", "pptx"):
+        text = _extract_ooxml_text(path, kind)
+        if not text:
+            return {"ok": False, "kind": "binary", "content": None,
+                    "reason": "无法从 Office 文件提取文本（可能已损坏或非标准 OOXML）。",
+                    "size": size, "truncated": False}
+        enc = text.encode("utf-8")
+        truncated = len(enc) > cfg.max_preview_bytes
+        if truncated:
+            text = enc[:cfg.max_preview_bytes].decode("utf-8", errors="ignore")
+        return {"ok": True, "kind": kind, "content": text, "reason": None,
+                "size": size, "truncated": truncated}
+
     if kind == "binary":
         return {"ok": False, "kind": "binary", "content": None,
-                "reason": "这是一个二进制文件，SeeTheFiles 仅支持文本预览。", "size": size, "truncated": False}
+                "reason": "这是一个二进制文件，SeeTheFiles 仅支持文本 / Office / PDF 预览。",
+                "size": size, "truncated": False}
     # text or large -> read (capped)
     try:
         with open(path, "rb") as fh:
@@ -355,6 +467,8 @@ ICON_COLORS = {
     "yaml": "#cb171e", "yml": "#cb171e", "toml": "#9c4221", "txt": "#89a52b", "cfg": "#6d8086",
     "ini": "#6d8086", "sh": "#89e051", "c": "#555555", "h": "#555555", "cpp": "#f34b7d",
     "go": "#00ADD8", "rs": "#dea584", "java": "#b07219", "rb": "#701516", "php": "#4F5D95",
+    "pdf": "#ef4444", "docx": "#2563eb", "doc": "#2563eb", "xlsx": "#16a34a", "xls": "#16a34a",
+    "pptx": "#ea580c", "ppt": "#ea580c",
     "default": "#94a3b8",
 }
 
@@ -391,7 +505,8 @@ def build_tree_html(node: dict, depth: int = 0) -> str:
         kind = node.get("kind")
         size = node.get("size") or 0
         color, letter = _icon_for(node["name"])
-        kind_cls = {"text": "k-text", "large": "k-large", "binary": "k-binary"}.get(kind, "k-binary")
+        kind_cls = {"text": "k-text", "large": "k-large", "binary": "k-binary",
+                    "pdf": "k-pdf", "docx": "k-doc", "xlsx": "k-xls", "pptx": "k-ppt"}.get(kind, "k-binary")
         size_str = _human_size(size)
         # Encode the node identity for preview lookup.
         node_id = html.escape(_node_id(node))
@@ -441,11 +556,14 @@ def render_html(scan: ScanResult, cfg: Config, root_path: str) -> str:
     _assign_ids(scan.tree)
     tree_html = build_tree_html(scan.tree, 0)
 
-    # Pre-embed preview payloads for text/large files (HOW Q2: embedded, no server).
-    # To keep the HTML bounded for huge directories (CAP-4), embedding is capped by a
-    # TOTAL BYTES BUDGET (max_embed_bytes) plus a hard file count ceiling
-    # (max_embed_files). Files beyond the budget get a friendly "preview disabled"
-    # notice instead of embedded text — this prevents the 5000 x 512KB = 2.5GB OOM.
+    # Pre-embed preview payloads for text/large/office/pdf files (HOW Q2:
+    # embedded, no server). To keep the HTML bounded for huge directories
+    # (CAP-4), embedding is capped by a TOTAL BYTES BUDGET (max_embed_bytes)
+    # plus a hard file count ceiling (max_embed_files). Files beyond the
+    # budget get a friendly "preview disabled" notice instead of embedded
+    # content — this prevents the 5000 x 512KB = 2.5GB OOM. PDF base64 counts
+    # ~1.33x its raw size toward the same budget, so a few large PDFs will
+    # saturate it faster (by design).
     _FILE_PAYLOADS.clear()
     embedded_count = 0
     embedded_bytes = 0
@@ -454,7 +572,7 @@ def render_html(scan: ScanResult, cfg: Config, root_path: str) -> str:
         nonlocal embedded_count, embedded_bytes
         if node["type"] == "file":
             kind = node.get("kind")
-            if kind in ("text", "large"):
+            if kind in ("text", "large", "pdf", "docx", "xlsx", "pptx"):
                 if embedded_count < cfg.max_embed_files and embedded_bytes < cfg.max_embed_bytes:
                     p = Path(root_path) / _strip_root(node["_id"], scan.tree["name"])
                     payload = extract_preview(p, cfg)
@@ -587,6 +705,15 @@ header .path {{ font-size:12px; color:var(--muted); margin-left:auto; max-width:
 .trunc {{ color:#f59e0b; margin-left:4px; }}
 .k-large .ic {{ outline:1px solid #f59e0b; }}
 .k-binary .ic {{ outline:1px solid #64748b; }}
+.k-pdf .ic {{ outline:1px solid #ef4444; }}
+.k-doc .ic {{ outline:1px solid #2563eb; }}
+.k-xls .ic {{ outline:1px solid #16a34a; }}
+.k-ppt .ic {{ outline:1px solid #ea580c; }}
+.pdf-wrap {{ display:flex; flex-direction:column; height:100%; }}
+.pdf-wrap embed {{ flex:1; min-height:62vh; border:0; border-radius:8px; background:#525659; }}
+.pdf-fallback {{ padding:10px 18px; font-size:12px; color:var(--muted); text-align:center; }}
+.pdf-fallback button {{ margin-left:6px; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:3px 10px; cursor:pointer; font-size:12px; }}
+.pdf-fallback button:hover {{ filter:brightness(1.1); }}
 .node.file.active > .row {{ background: var(--accent); color:#fff; }}
 .node.file.active > .row .sz {{ color:#e0e7ff; }}
 /* Preview panel */
@@ -678,8 +805,37 @@ function preview(row){{
       body.innerHTML = `<div class="notice warn"><h3>📦 预览已禁用</h3><p>${{escapeHtml(p.reason||'')}}</p><p>大小：{{formatSize(p.size)}}</p></div>`;
       return;
     }}
+    if (p.kind === 'pdf-large') {{
+      tag.textContent = 'PDF(过大)';
+      body.innerHTML = `<div class="notice warn"><h3>📄 PDF 过大</h3><p>${{escapeHtml(p.reason||'')}}</p><p>大小：{{formatSize(p.size)}}</p></div>`;
+      return;
+    }}
     tag.textContent = p.kind === 'binary' ? '二进制' : '错误';
     body.innerHTML = `<div class="notice ${{p.kind==='binary'?'binary':'warn'}}"><h3>${{p.kind==='binary'?'🚫 二进制文件':'⚠ 无法预览'}}</h3><p>${{escapeHtml(p.reason||'')}}</p><p>大小：{{formatSize(p.size)}}</p></div>`;
+    return;
+  }}
+  // PDF: render inline via a data: URI so the browser's built-in PDF viewer
+  // shows it. data: is NOT a file: URL, so this avoids the "file: URLs are
+  // unique security origins" cross-origin block. src is set via the DOM
+  // property (not an attribute string) so the large base64 never lands in
+  // an HTML attribute. A "open in new tab" button uses a Blob URL as a
+  // fallback when inline embedding is blocked by the browser.
+  if (p.kind === 'pdf') {{
+    tag.textContent = 'PDF';
+    body.innerHTML = '<div class="pdf-wrap"><embed id="pdf-emb" type="application/pdf"></div><div class="pdf-fallback">若上方未显示 PDF，可<button id="pdf-open-btn" type="button">在新标签页打开</button></div>';
+    document.getElementById('pdf-emb').src = 'data:application/pdf;base64,' + p.content;
+    document.getElementById('pdf-open-btn').onclick = function(){{ openPdfBlob(p.content); }};
+    body.classList.remove('preview-anim'); void body.offsetWidth; body.classList.add('preview-anim');
+    return;
+  }}
+  // Office OOXML: text extracted server-side, shown like a text preview.
+  if (p.kind === 'docx' || p.kind === 'xlsx' || p.kind === 'pptx') {{
+    const labels = {{docx:'Word', xlsx:'Excel', pptx:'PowerPoint'}};
+    tag.textContent = labels[p.kind] + '(文本)';
+    let content = escapeHtml(p.content);
+    if (p.truncated) content += '\\n\\n… (已截断，仅显示前 ' + formatSize(PAYLOADS_MAX) + '，完整内容请用 Office 打开)';
+    body.innerHTML = '<pre>' + content + '</pre>';
+    body.classList.remove('preview-anim'); void body.offsetWidth; body.classList.add('preview-anim');
     return;
   }}
   tag.textContent = p.kind === 'large' ? '大文件(截断)' : '文本';
@@ -695,6 +851,20 @@ function formatSize(n){{
   if (n < 1024) return n + ' B';
   if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
   return (n/1024/1024).toFixed(1) + ' MB';
+}}
+
+// Fallback for PDF preview: decode the base64 to a Blob and open it in a new
+// tab via a Blob URL. Blob URLs are same-origin to the file:// page, so this
+// works even where inline <embed> is blocked. Used when the user clicks the
+// "在新标签页打开" button under an inline PDF that failed to render.
+function openPdfBlob(b64){{
+  try {{
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], {{type:'application/pdf'}}));
+    window.open(url);
+  }} catch(e){{ alert('无法打开 PDF: ' + (e&&e.message||e)); }}
 }}
 
 function filterTree(q){{
