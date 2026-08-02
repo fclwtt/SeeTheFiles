@@ -15,3 +15,6 @@ SeeTheFiles-Run.log
 
 # OS
 .DS_Store
+
+# Local agent working memory (not project code)
+.codebuddy/
