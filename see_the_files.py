@@ -738,6 +738,33 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--print-json", action="store_true", help="仅打印目录树 JSON 到 stdout（调试）")
     args = parser.parse_args(argv)
 
+    # On Windows --windowed builds (Run.exe launched from Explorer) there is no
+    # console, so Python sets sys.stdout/sys.stderr to None. Any code that does
+    # `print(...)` or `sys.stderr.write(...)` would then raise
+    # "AttributeError: 'NoneType' object has no attribute 'write'". Redirect both
+    # streams to a log file next to the exe so status messages are preserved and
+    # harmless instead of crashing the whole run.
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            _log_dir = Path(sys.argv[0]).resolve().parent
+            _log_path = _log_dir / "SeeTheFiles.log"
+            _fh = open(_log_path, "a", encoding="utf-8")
+            if sys.stdout is None:
+                sys.stdout = _fh
+            if sys.stderr is None:
+                sys.stderr = _fh
+        except OSError:
+            # Last-resort: swallow so we never crash on logging setup.
+            class _Null:
+                def write(self, *a, **k):
+                    return 0
+                def flush(self, *a, **k):
+                    return None
+            if sys.stdout is None:
+                sys.stdout = _Null()
+            if sys.stderr is None:
+                sys.stderr = _Null()
+
     target = args.path
     if not target:
         parser.print_help()
